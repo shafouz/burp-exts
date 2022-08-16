@@ -12,8 +12,10 @@ class BurpExtender
     @message= ""
     @requests = Dir["./requests/*"].map {|r| r = File.basename(r, ".*")}
     @is_subrequest = false
-    @jwt = ""
-    @update_time = 0
+    @jwt = {}
+    @minutes = 20 * 60
+    @update_time = Time.now.to_i + @minutes
+    @acc_name = ""
   end
 
   def registerExtenderCallbacks(callbacks)
@@ -24,18 +26,11 @@ class BurpExtender
   end
 
   def fetch_jwt
-    return if Time.now.to_i < @update_time
     @is_subrequest = true
-
-    name = /^Acc: (.+?)\r\n/.match @helpers.bytesToString(@message.getRequest)
-
-    if !name
-      puts "no Acc header found in request"
-      return
-    end
+    @requests = Dir["./requests/*"].map {|r| r = File.basename(r, ".*")}
 
     begin
-      request_file = @requests.find {|r| r == name[1]}
+      request_file = @requests.find {|r| r == @acc_name}
       request_file = File.read("requests/#{request_file}.txt").split("\n")
 
       host = request_file.find {|h| h.match "^Host:.*$"}.split(" ")[-1]
@@ -49,32 +44,44 @@ class BurpExtender
 
       response = @callbacks.makeHttpRequest(host, port, true, message)
 
-      jwt = /\r\n\r\n(.*)/.match @helpers.bytesToString(response)
+      _jwt = /\r\n\r\n(.*)/.match @helpers.bytesToString(response)
 
-      if !jwt
+      if !_jwt
         puts "No response body found"
         return
       end
-      @jwt = jwt[1]
+      @jwt[@acc_name][:token] = _jwt[1]
     end
   end
 
   def processHttpMessage(toolFlag, messageIsRequest, message)
     return if !messageIsRequest
     return if @is_subrequest
+
     @message = message
+    @acc_name = (/^Acc: (.+?)\r\n/.match @helpers.bytesToString(@message.getRequest))[1]
+    @jwt[@acc_name] ||= {}
 
-    fetch_jwt
-    @is_subrequest = false
+    if @acc_name
+      @jwt[@acc_name][:update_time] = Time.now.to_i + @minutes if !@jwt[@acc_name].key? :update_time
 
-    req = @helpers.analyzeRequest(message.getRequest)
-    headers = req.getHeaders
-    headers = headers.filter {|r| !r.match?(/^Authorization:.*$/)}.push("Authorization: Bearer #{@jwt}")
+      if (Time.now.to_i >= @jwt[@acc_name][:update_time]) || (!@jwt[@acc_name].key? :token)
+        fetch_jwt 
+        @is_subrequest = false
+      end
 
-    final_req = @helpers.buildHttpMessage(headers, nil)
-    message.setRequest(final_req) 
+      req = @helpers.analyzeRequest(message.getRequest)
+      body_offset = req.getBodyOffset
+      body = message.getRequest()[body_offset..-1]
+      
+      headers = req.getHeaders
+      headers = headers.filter {|r| !r.match?(/^Authorization:.*$/)}
+        .push("Authorization: Bearer #{@jwt[@acc_name][:token]}")
 
-    minutes = 20 * 60
-    @update_time = Time.now.to_i + minutes.to_i
+      final_req = @helpers.buildHttpMessage(headers, body)
+      message.setRequest(final_req) 
+    else
+      return
+    end
   end
 end
